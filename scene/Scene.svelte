@@ -57,6 +57,8 @@
 	export let backgroundOpacity = 1;
 	export let fog = undefined;
 	export let pixelRatio = undefined;
+	export let xrSessionType = undefined;
+	export let xrRefSpaceType = undefined;
 
 	const use_fog = 'fog' in $$props;
 
@@ -71,11 +73,46 @@
 
 	let gl;
 	let draw = () => {};
+	let drawXR = () => {};
 	let camera_stores = {
 		camera_matrix: writable(),
 		view: writable(),
 		projection: writable()
 	};
+
+	// WebXR globals.
+	let xrSession = null;
+	let xrRefSpace = null;
+
+	export async function isXrAvailable() {
+		return !!navigator.xr && 
+			!!xrSessionType && 
+			await navigator.xr.isSessionSupported(xrSessionType);
+	};
+
+	async function onSessionStarted(session) {
+		gl.makeXRCompatible();
+
+		session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+
+		xrRefSpace = await session.requestReferenceSpace(xrRefSpaceType);
+
+		session.requestAnimationFrame(drawXR);
+	}
+
+	function onSessionEnded(event) {
+		xrSession = null;
+	}
+
+	export async function toggleXR() {
+		if (await isXrAvailable() && !xrSession) {
+			xrSession = await navigator.xr.requestSession(xrSessionType);
+			xrSession.addEventListener('end', onSessionEnded);
+			onSessionStarted(xrSession);
+		} else if (xrSession) {
+			xrSession.end();
+		}
+	}
 
 	const invalidate = typeof window !== 'undefined'
 		? () => {
@@ -220,6 +257,7 @@
 
 			pending = false;
 
+			gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 			gl.clearColor(...bg, backgroundOpacity);
 			gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -366,6 +404,193 @@
 
 			render_layer(root_layer);
 			camera_position_changed_since_last_render = false;
+		};
+
+		drawXR = (time, frame) => {
+			gl.clearColor(...bg, backgroundOpacity);
+			gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+			gl.enable(gl.CULL_FACE);
+			gl.enable(gl.BLEND);
+
+			// calculate total ambient light
+			const ambient_light = lights.ambient.reduce((total, { color, intensity }) => {
+				return [
+					Math.min(total[0] + color[0] * intensity, 1),
+					Math.min(total[1] + color[1] * intensity, 1),
+					Math.min(total[2] + color[2] * intensity, 1)
+				];
+			}, new Float32Array([0, 0, 0]));
+
+			let previous_program;
+
+			let previous_state = {
+				[gl.DEPTH_TEST]: null,
+				[gl.CULL_FACE]: null
+			};
+
+			const enable = (key, enabled) => {
+				if (previous_state[key] !== enabled) {
+					if (enabled) gl.enable(key);
+					else gl.disable(key);
+
+					previous_state[key] = enabled;
+				}
+			};
+
+			function render_mesh({
+				model,
+				model_inverse_transpose,
+				geometry,
+				material,
+				depthTest,
+				doubleSided
+			}, camera) {
+				// TODO should this even be possible?
+				if (!material) return;
+
+				enable(gl.DEPTH_TEST, depthTest !== false);
+				enable(gl.CULL_FACE, doubleSided !== true);
+
+				gl.blendFuncSeparate(
+					gl.SRC_ALPHA, // source rgb
+					gl.ONE_MINUS_SRC_ALPHA, // dest rgb
+					gl.SRC_ALPHA, // source alpha
+					gl.ONE // dest alpha
+				);
+
+				if (material.program !== previous_program) {
+					previous_program = material.program;
+
+					// TODO move logic to the mesh/material?
+					gl.useProgram(material.program);
+
+					// set built-ins
+					gl.uniform3fv(material.uniform_locations.AMBIENT_LIGHT, ambient_light);
+
+					if (use_fog) {
+						gl.uniform3fv(material.uniform_locations.FOG_COLOR, bg);
+						gl.uniform1f(material.uniform_locations.FOG_DENSITY, fog);
+					}
+
+					if (material.uniform_locations.DIRECTIONAL_LIGHTS) {
+						for (let i = 0; i < num_lights; i += 1) {
+							const light = lights.directional[i];
+							if (!light) break;
+
+							gl.uniform3fv(material.uniform_locations.DIRECTIONAL_LIGHTS[i].direction, light.direction);
+							gl.uniform3fv(material.uniform_locations.DIRECTIONAL_LIGHTS[i].color, light.color);
+							gl.uniform1f(material.uniform_locations.DIRECTIONAL_LIGHTS[i].intensity, light.intensity);
+						}
+					}
+
+					if (material.uniform_locations.POINT_LIGHTS) {
+						for (let i = 0; i < num_lights; i += 1) {
+							const light = lights.point[i];
+							if (!light) break;
+
+							gl.uniform3fv(material.uniform_locations.POINT_LIGHTS[i].location, light.location);
+							gl.uniform3fv(material.uniform_locations.POINT_LIGHTS[i].color, light.color);
+							gl.uniform1f(material.uniform_locations.POINT_LIGHTS[i].intensity, light.intensity);
+						}
+					}
+
+					gl.uniform3fv(material.uniform_locations.CAMERA_WORLD_POSITION, camera.world_position);
+					gl.uniformMatrix4fv(material.uniform_locations.VIEW, false, camera.view);
+					gl.uniformMatrix4fv(material.uniform_locations.PROJECTION, false, camera.projection);
+				}
+
+				// set mesh-specific built-in uniforms
+				gl.uniformMatrix4fv(material.uniform_locations.MODEL, false, model);
+				gl.uniformMatrix4fv(material.uniform_locations.MODEL_INVERSE_TRANSPOSE, false, model_inverse_transpose);
+
+				// set material-specific built-in uniforms
+				material.apply_uniforms(gl);
+
+				// set attributes
+				geometry.set_attributes(gl);
+
+				// draw
+				if (geometry.index) {
+					gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, geometry.buffers.__index);
+					gl.drawElements(gl[geometry.primitive], geometry.index.length, gl.UNSIGNED_INT, 0);
+				} else {
+					const primitiveType = gl[geometry.primitive];
+					gl.drawArrays(primitiveType, 0, geometry.count);
+				}
+			}
+
+			function render_layer(layer, camera) {
+				if (layer.needs_sort) {
+					layer.child_layers.sort((a, b) => a.index - b.index);
+					layer.needs_sort = false;
+				}
+
+				gl.depthMask(true);
+				gl.clearDepth(1.0);
+				gl.clear(gl.DEPTH_BUFFER_BIT);
+
+				for (let i = 0; i < layer.meshes.length; i += 1) {
+					render_mesh(layer.meshes[i], camera);
+				}
+
+				// TODO sort transparent meshes, furthest to closest
+				gl.depthMask(false);
+
+				if (layer.needs_transparency_sort) {
+					sort_transparent_meshes(layer.transparent_meshes);
+					layer.needs_transparency_sort = false;
+				}
+
+				for (let i = 0; i < layer.transparent_meshes.length; i += 1) {
+					render_mesh(layer.transparent_meshes[i], camera);
+				}
+
+				for (let i = 0; i < layer.child_layers.length; i += 1) {
+					render_layer(layer.child_layers[i], camera);
+				}
+			}
+
+			let session = frame.session;
+			session.requestAnimationFrame(drawXR);
+			let pose = frame.getViewerPose(xrRefSpace);
+			if (pose) {
+				let glLayer = session.renderState.baseLayer;
+				gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
+				gl.clearColor(0, 0, 0, 1.0);
+				gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+				for (let poseView of pose.views) {
+					let viewport = glLayer.getViewport(poseView);
+					gl.viewport(viewport.x, viewport.y,
+						viewport.width, viewport.height);
+					// Draw a scene using view.projectionMatrix as the projection matrix
+					// and view.transform to position the virtual camera. If you need a
+					// view matrix, use view.transform.inverse.matrix.
+					const viewMatrix = mat4.fromRotationTranslation(
+						[],
+						[
+							poseView.transform.orientation.x,
+							poseView.transform.orientation.y,
+							poseView.transform.orientation.z,
+							poseView.transform.orientation.w
+						],
+						[
+							poseView.transform.position.x,
+							poseView.transform.position.y,
+							poseView.transform.position.z
+						]
+					);
+					mat4.invert(viewMatrix, viewMatrix);
+					const p = poseView.transform.position;
+					render_layer(root_layer, {
+						world_position: [p.x,p.y,p.z],
+						view: viewMatrix,
+						projection: poseView.projectionMatrix
+						});
+				}
+			}
+
 		};
 
 		// for some wacky reason, Adblock Plus seems to prevent the
