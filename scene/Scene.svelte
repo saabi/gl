@@ -49,9 +49,8 @@
 	import { setContext, onMount, onDestroy, tick } from 'svelte';
 	import { writable } from 'svelte/store';
 	import { RENDERER, LAYER, PARENT, CAMERA, create_layer } from '../internal/index.mjs';
-	import { create_worker, process_color } from '../internal/utils.mjs';
+	import { process_color } from '../internal/utils.mjs';
 	import * as mat4 from 'gl-matrix/mat4';
-	import * as vec3 from 'gl-matrix/vec3';
 
 	export let background = [1, 1, 1];
 	export let backgroundOpacity = 1;
@@ -68,8 +67,6 @@
 	let visible = writable(false);
 	let pending = false;
 	let update_scheduled = false;
-	let w;
-	let h;
 
 	let gl;
 	let draw = () => {};
@@ -91,7 +88,7 @@
 	};
 
 	async function onSessionStarted(session) {
-		gl.makeXRCompatible();
+		await gl.makeXRCompatible();
 		session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
 		xrRefSpace = await session.requestReferenceSpace(xrRefSpaceType);
 		session.requestAnimationFrame(drawXR);
@@ -599,10 +596,14 @@
 					mat4.invert(viewMatrix, viewMatrix);
 					const p = poseView.transform.position;
 					render_layer(root_layer, {
-						world_position: [p.x,p.y,p.z],
+						world_position: [
+							xrCamera.world_position[0] + p.x,
+							xrCamera.world_position[1] + p.y,
+							xrCamera.world_position[2] + p.z
+						],
 						view: viewMatrix,
 						projection: poseView.projectionMatrix
-						});
+					});
 				}
 			}
 
