@@ -92,11 +92,8 @@
 
 	async function onSessionStarted(session) {
 		gl.makeXRCompatible();
-
 		session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
-
 		xrRefSpace = await session.requestReferenceSpace(xrRefSpaceType);
-
 		session.requestAnimationFrame(drawXR);
 	}
 
@@ -104,12 +101,16 @@
 		xrSession = null;
 	}
 
-	export async function toggleXR() {
+	export async function activateXR () {
 		if (await isXrAvailable() && !xrSession) {
 			xrSession = await navigator.xr.requestSession(xrSessionType);
 			xrSession.addEventListener('end', onSessionEnded);
 			onSessionStarted(xrSession);
-		} else if (xrSession) {
+		}
+	}
+
+	export async function deactivateXR () {
+		if (xrSession) {
 			xrSession.end();
 		}
 	}
@@ -130,6 +131,7 @@
 
 	const default_camera = { /* TODO */ };
 	let camera = default_camera;
+	let xrCamera = null;
 	const num_lights = 8;
 
 	const meshes = [];
@@ -162,6 +164,22 @@
 			`#define NUM_LIGHTS 2\n` + // TODO configure this
 			`#define USE_FOG ${use_fog}\n`
 		].join(''),
+
+		add_xrCamera: _xrCamera => {
+			if (xrCamera) {
+				throw new Error(`A scene can only have one XR camera`);
+			}
+
+			xrCamera = _xrCamera;
+			invalidate();
+			activateXR();
+
+			onDestroy(() => {
+				xrCamera = null;
+				invalidate();
+				deactivateXR();
+			});
+		},
 
 		add_camera: _camera => {
 			if (camera && camera !== default_camera) {
@@ -407,9 +425,6 @@
 		};
 
 		drawXR = (time, frame) => {
-			gl.clearColor(...bg, backgroundOpacity);
-			gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
 			gl.enable(gl.CULL_FACE);
 			gl.enable(gl.BLEND);
 
@@ -557,7 +572,7 @@
 			if (pose) {
 				let glLayer = session.renderState.baseLayer;
 				gl.bindFramebuffer(gl.FRAMEBUFFER, glLayer.framebuffer);
-				gl.clearColor(0, 0, 0, 1.0);
+				gl.clearColor(...bg, 1.0);
 				gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
 				for (let poseView of pose.views) {
